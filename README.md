@@ -10,6 +10,9 @@ this is a  modified version of  [FAST-LIO2](https://github.com/hku-mars/FAST_LIO
 
 ![avatar](./docs/map.png)
 
+![avatar](./docs/submap4.png)
+
+
 ## Features
 -  directly mapping in UTM Coordinate system
 
