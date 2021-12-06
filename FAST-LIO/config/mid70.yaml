@@ -1,0 +1,41 @@
+common:
+    lid_topic:  "/livox/lidar"
+    #imu_topic:  "/livox/imu"
+    imu_topic:  "/imu/data"
+    time_sync_en: true         
+
+preprocess:
+    lidar_type: 1               
+    scan_line: 6
+    blind: 4
+
+mapping:
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    fov_degree:    90
+    det_range:     450.0
+    extrinsic_T: [ 0.04165, 0.02326, -0.0284 ]
+    extrinsic_R: [ 1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1]   # xsens710
+    
+
+    # extrinsic_R: [ 0,    -1,     0,
+    #                1,     0,     0,
+    #                0,     0,     1]   # xsens700
+
+
+    # extrinsic_R: [ 0, 1, 0,
+    #                -1, 0, 0,
+    #                0, 0, 1]   # xsens700
+
+
+                  
+    
+
+publish:     
+    scan_publish_en:  1       
+    dense_publish_en: 1       
+    scan_bodyframe_pub_en: 1  

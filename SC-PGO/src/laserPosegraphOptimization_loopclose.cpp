@@ -452,6 +452,31 @@ void loopFindNearKeyframesCloud_jxx( pcl::PointCloud<PointType>::Ptr& nearKeyfra
 } // loopFindNearKeyframesCloud
 
 
+void loopFindNearKeyframesCloud_jxx_lookback( pcl::PointCloud<PointType>::Ptr& nearKeyframes, const int& key, const int& submap_size)
+{
+    // extract and stacking near keyframes (in global coord)
+    nearKeyframes->clear();
+    for (int i = -submap_size; i <= 0; ++i) {
+        int keyNear = key + i;
+        if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) )
+            continue;
+
+        mKF.lock(); 
+        *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[keyNear]);
+        mKF.unlock(); 
+    }
+
+    if (nearKeyframes->empty())
+        return;
+
+    // downsample near keyframes
+    pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+    downSizeFilterICP.setInputCloud(nearKeyframes);
+    downSizeFilterICP.filter(*cloud_temp);
+    *nearKeyframes = *cloud_temp;
+} // loopFindNearKeyframesCloud
+
+
 std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
 {
     // parse pointclouds
@@ -601,7 +626,11 @@ void process_pg()
             keyframePosesUpdated.push_back(pose_curr); // init
             keyframeTimes.push_back(timeLaserOdometry);
 
-            scManager.makeAndSaveScancontextAndKeys(*thisKeyFrameDS);
+            if 
+            pcl::PointCloud<PointType>::Ptr theFrame(new pcl::PointCloud<PointType>());
+            loopFindNearKeyframesCloud_jxx_lookback(theFrame, keyframePoses.size() - 1,20);
+
+            scManager.makeAndSaveScancontextAndKeys(*theFrame);
 
             laserCloudMapPGORedraw = true;
             mKF.unlock(); 
