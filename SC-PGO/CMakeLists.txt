@@ -18,6 +18,7 @@ find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   tf
   geodesy
+  visualization_msgs
   message_generation
 )
 
@@ -78,7 +79,8 @@ target_link_libraries(alaserPGO_gps
 
 
 add_executable(alaserPGO
-  src/laserPosegraphOptimization.cpp
+  src/laserPosegraphOptimization_fpfh.cpp
+  # src/laserPosegraphOptimization.cpp
   include/scancontext/Scancontext.cpp
 )
 target_compile_options(alaserPGO 

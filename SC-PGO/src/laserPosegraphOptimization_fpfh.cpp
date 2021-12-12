@@ -24,6 +24,17 @@
 #include <pcl/filters/crop_box.h> 
 #include <pcl_conversions/pcl_conversions.h>
 
+
+#include <pcl/features/fpfh.h>
+#include <pcl/registration/ia_ransac.h>
+#include <pcl/features/normal_3d.h>
+
+#include <pcl/features/fpfh_omp.h> //包含fpfh加速计算的omp(多核并行计算)
+#include <pcl/registration/correspondence_estimation.h>
+#include <pcl/registration/correspondence_rejection_features.h> //特征的错误对应关系去除
+#include <pcl/registration/correspondence_rejection_sample_consensus.h> 
+
+
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -35,10 +46,6 @@
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <geometry_msgs/PoseStamped.h>
-
-#include <visualization_msgs/Marker.h>
-#include <visualization_msgs/MarkerArray.h>
-
 
 #include <eigen3/Eigen/Dense>
 
@@ -68,6 +75,14 @@ using namespace gtsam;
 using std::cout;
 using std::endl;
 
+
+using namespace std;
+typedef pcl::PointCloud<PointType> pointcloud;
+typedef pcl::PointCloud<pcl::Normal> pointnormal;
+typedef pcl::PointCloud<pcl::FPFHSignature33> fpfhFeature;
+
+
+
 double keyframeMeterGap;
 double keyframeDegGap, keyframeRadGap;
 double translationAccumulated = 1000000.0; // large value means must add the first given frame.
@@ -87,7 +102,6 @@ std::mutex mBuf;
 std::mutex mKF;
 
 double timeLaserOdometry = 0.0;
-std_msgs::Header timeLaserOdometr_header;
 double timeLaser = 0.0;
 
 pcl::PointCloud<PointType>::Ptr laserCloudFullRes(new pcl::PointCloud<PointType>());
@@ -95,19 +109,9 @@ pcl::PointCloud<PointType>::Ptr laserCloudMapAfterPGO(new pcl::PointCloud<PointT
 
 std::vector<pcl::PointCloud<PointType>::Ptr> keyframeLaserClouds; 
 std::vector<Pose6D> keyframePoses;
-std::vector<Pose6D> copy_keyframePoses;
-
 std::vector<Pose6D> keyframePosesUpdated;
 std::vector<double> keyframeTimes;
 int recentIdxUpdated = 0;
-
-
-pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D;
-pcl::PointCloud<PointType>::Ptr copy_cloudKeyPoses3D;
-map<int, int> loopIndexContainer;
-pcl::KdTreeFLANN<PointType>::Ptr kdtreeHistoryKeyPoses;
-bool detectLoopClosureDistance(int *latestID, int *closestID);
-void visualizeLoopClosure();
 
 gtsam::NonlinearFactorGraph gtSAMgraph;
 bool gtSAMgraphMade = false;
@@ -143,14 +147,38 @@ double recentOptimizedX = 0.0;
 double recentOptimizedY = 0.0;
 
 ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;
-ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
+ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal,pubLoopScanLocal_aftSac;
 ros::Publisher pubOdomRepubVerifier;
-ros::Publisher pubLoopConstraintEdge;
 
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
 std::string odomKITTIformat;
 std::fstream pgTimeSaveStream;
+
+fpfhFeature::Ptr compute_fpfh_feature(pointcloud::Ptr input_cloud,pcl::search::KdTree<PointType>::Ptr tree)
+{
+        //法向量
+        pointnormal::Ptr point_normal (new pointnormal);
+        pcl::NormalEstimation<PointType,pcl::Normal> est_normal;
+        est_normal.setInputCloud(input_cloud);
+        est_normal.setSearchMethod(tree);
+        est_normal.setKSearch(10);
+        est_normal.compute(*point_normal);
+        //fpfh 估计
+        fpfhFeature::Ptr fpfh (new fpfhFeature);
+        //pcl::FPFHEstimation<pcl::PointXYZ,pcl::Normal,pcl::FPFHSignature33> est_target_fpfh;
+        pcl::FPFHEstimationOMP<PointType,pcl::Normal,pcl::FPFHSignature33> est_fpfh;
+        est_fpfh.setNumberOfThreads(4); //指定4核计算
+        // pcl::search::KdTree<pcl::PointXYZ>::Ptr tree4 (new pcl::search::KdTree<pcl::PointXYZ> ());
+        est_fpfh.setInputCloud(input_cloud);
+        est_fpfh.setInputNormals(point_normal);
+        est_fpfh.setSearchMethod(tree);
+        est_fpfh.setKSearch(10);
+        est_fpfh.compute(*fpfh);
+
+        return fpfh;
+        
+}
 
 std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
@@ -471,11 +499,11 @@ void loopFindNearKeyframesCloud_jxx( pcl::PointCloud<PointType>::Ptr& nearKeyfra
 std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
 {
     // parse pointclouds
-    int historyKeyframeSearchNum = 50; // enough. ex. [-25, 25] covers submap length of 50x1 = 50m if every kf gap is 1m
+    int historyKeyframeSearchNum = 100; // enough. ex. [-25, 25] covers submap length of 50x1 = 50m if every kf gap is 1m
     pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr targetKeyframeCloud(new pcl::PointCloud<PointType>());
     // loopFindNearKeyframesCloud_jxx(cureKeyframeCloud, _curr_kf_idx,5, _loop_kf_idx); // use same root of loop kf idx 
-    loopFindNearKeyframesCloud_jxx(cureKeyframeCloud, _curr_kf_idx,25, _curr_kf_idx);
+    loopFindNearKeyframesCloud_jxx(cureKeyframeCloud, _curr_kf_idx,50, _curr_kf_idx);
     loopFindNearKeyframesCloud_jxx(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx); 
 
     // loop verification 
@@ -489,6 +517,52 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     targetKeyframeCloudMsg.header.frame_id = "camera_init";
     pubLoopSubmapLocal.publish(targetKeyframeCloudMsg);
 
+
+    std::string curr_node_idx_str = padZeros(_curr_kf_idx);
+    pcl::io::savePCDFileBinary("/home/jiangxx/workspace/" + curr_node_idx_str + ".pcd", *cureKeyframeCloud); // scan 
+    curr_node_idx_str = padZeros(_loop_kf_idx);
+    pcl::io::savePCDFileBinary("/home/jiangxx/workspace/" + curr_node_idx_str + ".pcd", *targetKeyframeCloud); // scan 
+
+    Eigen::Matrix4f guess_trans;
+    {
+        pcl::search::KdTree<PointType>::Ptr tree (new pcl::search::KdTree<PointType> ());
+
+        fpfhFeature::Ptr source_fpfh =  compute_fpfh_feature(cureKeyframeCloud,tree);
+        fpfhFeature::Ptr target_fpfh =  compute_fpfh_feature(targetKeyframeCloud,tree);
+
+         //对齐(占用了大部分运行时间)
+        pcl::SampleConsensusInitialAlignment<PointType, PointType, pcl::FPFHSignature33> sac_ia;
+        sac_ia.setInputSource(cureKeyframeCloud);
+        sac_ia.setSourceFeatures(source_fpfh);
+        sac_ia.setInputTarget(targetKeyframeCloud);
+        sac_ia.setTargetFeatures(target_fpfh);
+        // sac_ia.setMaxCorrespondenceDistance (max_correspondence_distance_);
+        pcl::PointCloud<PointType>::Ptr align(new pcl::PointCloud<PointType>());
+        //  sac_ia.setNumberOfSamples(20);  //设置每次迭代计算中使用的样本数量（可省）,可节省时间
+        sac_ia.setCorrespondenceRandomness(6); //设置计算协方差时选择多少近邻点，该值越大，协防差越精确，但是计算效率越低.(可省)
+        sac_ia.align(*align); 
+        
+
+        double fitness_score = (float) sac_ia.getFitnessScore ();
+        guess_trans = sac_ia.getFinalTransformation ();
+
+        float loopFitnessScoreThreshold =10;
+        if (sac_ia.hasConverged() == false || sac_ia.getFitnessScore() > loopFitnessScoreThreshold) {
+            std::cout << "[SAC loop] sac_ia fitness test failed (" << sac_ia.getFitnessScore() << " > " << loopFitnessScoreThreshold << "). may Reject this SC loop." << std::endl;
+            return std::nullopt;
+        } else {
+            std::cout << "[SAC loop] sac_ia fitness test passed (" << sac_ia.getFitnessScore() << " < " << loopFitnessScoreThreshold << "). may Add this SC loop." << std::endl;
+        }
+
+        sensor_msgs::PointCloud2 cureKeyframeCloudMsg;
+        pcl::toROSMsg(*align, cureKeyframeCloudMsg);
+        cureKeyframeCloudMsg.header.frame_id = "camera_init";
+        pubLoopScanLocal_aftSac.publish(cureKeyframeCloudMsg);
+
+    }
+     
+
+
     // ICP Settings
     pcl::IterativeClosestPoint<PointType, PointType> icp;
     // icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter 
@@ -497,7 +571,7 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     // icp.setEuclideanFitnessEpsilon(1e-6);
     // icp.setRANSACIterations(0);
 
-    icp.setMaxCorrespondenceDistance(50); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter 
+    icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter 
     icp.setMaximumIterations(100);
     icp.setTransformationEpsilon(1e-6);
     icp.setEuclideanFitnessEpsilon(1e-6);
@@ -507,9 +581,9 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     icp.setInputSource(cureKeyframeCloud);
     icp.setInputTarget(targetKeyframeCloud);
     pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
-    icp.align(*unused_result);
+    icp.align(*unused_result, guess_trans);
  
-    float loopFitnessScoreThreshold =10; // user parameter but fixed low value is safe. 
+    float loopFitnessScoreThreshold =3; // user parameter but fixed low value is safe. 
     if (icp.hasConverged() == false || icp.getFitnessScore() > loopFitnessScoreThreshold) {
         std::cout << "[SC loop] ICP fitness test failed (" << icp.getFitnessScore() << " > " << loopFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
         return std::nullopt;
@@ -548,7 +622,6 @@ void process_pg()
 
             // Time equal check
             timeLaserOdometry = odometryBuf.front()->header.stamp.toSec();
-            timeLaserOdometr_header = odometryBuf.front()->header;
             timeLaser = fullResBuf.front()->header.stamp.toSec();
             // TODO
 
@@ -623,6 +696,7 @@ void process_pg()
             laserCloudMapPGORedraw = true;
             mKF.unlock(); 
 
+            //cout<<"count="<<keyframePoses.size()<<endl;
             const int prev_node_idx = keyframePoses.size() - 2; 
             const int curr_node_idx = keyframePoses.size() - 1; // becuase cpp starts with 0 (actually this index could be any number, but for simple implementation, we follow sequential indexing)
             if( ! gtSAMgraphMade /* prior node */) {
@@ -706,95 +780,6 @@ void performSCLoopClosure(void)
     }
 } // performSCLoopClosure
 
-void performSCLoopClosure_jxx(void)
-{
-    if( int(keyframePosesUpdated.size()) < 200) // do not try too early 
-        return;
-
-    cloudKeyPoses3D.reset(new pcl::PointCloud<PointType>());
-    //每次都copy一遍，好麻烦
-    for(int i=0;i<keyframePosesUpdated.size();i++)
-    {
-        PointType thisPose3D;
-        thisPose3D.x = keyframePosesUpdated[i].x;
-        thisPose3D.y = keyframePosesUpdated[i].y;
-        thisPose3D.z = keyframePosesUpdated[i].z;
-        thisPose3D.intensity = i; // this can be used as index
-        cloudKeyPoses3D->push_back(thisPose3D);
-    }
-   
-
-    // find keys
-    int loopKeyCur;
-    int loopKeyPre;
-   
-    if (detectLoopClosureDistance(&loopKeyCur, &loopKeyPre) == false)
-        return;
-
-    //extract cloud
-    // pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
-    // pcl::PointCloud<PointType>::Ptr prevKeyframeCloud(new pcl::PointCloud<PointType>());
-    // {
-    //     loopFindNearKeyframes(cureKeyframeCloud, loopKeyCur, 0);
-    //     loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum);
-    //     if (cureKeyframeCloud->size() < 300 || prevKeyframeCloud->size() < 1000)
-    //         return;
-    //     if (pubHistoryKeyFrames.getNumSubscribers() != 0)
-    //         publishCloud(&pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, odometryFrame);
-    // }
-
-
-    auto relative_pose_optional = doICPVirtualRelative(loopKeyPre, loopKeyCur);
-    if(relative_pose_optional) {
-        gtsam::Pose3 relative_pose = relative_pose_optional.value();
-        mtxPosegraph.lock();
-        gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(loopKeyPre, loopKeyCur, relative_pose, robustLoopNoise));
-        // runISAM2opt();
-        mtxPosegraph.unlock();
-    } 
-} // performSCLoopClosure_jxx
-
-bool detectLoopClosureDistance(int *latestID, int *closestID)
-{
-    int loopKeyCur = cloudKeyPoses3D->size() - 1;
-    int loopKeyPre = -1;
-
-    // check loop constraint added before
-    auto it = loopIndexContainer.find(loopKeyCur);
-    if (it != loopIndexContainer.end())
-        return false;
-
-    // find the closest history key frame
-    int historyKeyframeSearchRadius = 15;
-    std::vector<int> pointSearchIndLoop;
-    std::vector<float> pointSearchSqDisLoop;
-     cout<<" cloudKeyPoses3D.size()=" <<cloudKeyPoses3D->size()<<endl;   
-    kdtreeHistoryKeyPoses->setInputCloud(cloudKeyPoses3D);
-    kdtreeHistoryKeyPoses->radiusSearch(cloudKeyPoses3D->back(), historyKeyframeSearchRadius, pointSearchIndLoop, pointSearchSqDisLoop, 0);
-
-    cout<<" kdtreeHistoryKeyPoses->radiusSearch done!,pointSearchIndLoop.size()" <<pointSearchIndLoop.size()<<endl;   
-    for (int i = 0; i < (int)pointSearchIndLoop.size(); ++i)
-    {
-        int id = pointSearchIndLoop[i];
-        double historyKeyframeSearchTimeDiff = 50;
-        // if (abs(copy_cloudKeyPoses6D->points[id].time - timeLaserInfoCur) > historyKeyframeSearchTimeDiff)
-        cout<<" timediff=" <<abs(keyframeTimes[id] - timeLaserOdometry)<<endl; 
-        if (abs(keyframeTimes[id] - timeLaserOdometry) > historyKeyframeSearchTimeDiff)
-        {
-            loopKeyPre = id;
-            break;
-        }
-    }
-    cout<<" loopKeyPre=" <<loopKeyPre<<"<--->"<<loopKeyCur<<endl;  
-    if (loopKeyPre == -1 || loopKeyCur == loopKeyPre)
-        return false;
-
-    *latestID = loopKeyCur;
-    *closestID = loopKeyPre;
-
-    return true;
-}// detectLoopClosureDistance
-
 void process_lcd(void)
 {
     float loopClosureFrequency = 1.0; // can change 
@@ -802,105 +787,65 @@ void process_lcd(void)
     while (ros::ok())
     {
         rate.sleep();
-        //performSCLoopClosure();
-        performSCLoopClosure_jxx(); // TODO
-        visualizeLoopClosure();
+        performSCLoopClosure();
+        // performRSLoopClosure(); // TODO
     }
 } // process_lcd
-
-void visualizeLoopClosure()
-{
-        if (loopIndexContainer.empty())
-            return;
-        
-        visualization_msgs::MarkerArray markerArray;
-        // loop nodes
-        visualization_msgs::Marker markerNode;
-        markerNode.header.frame_id = "camera_init";
-        markerNode.header.stamp = timeLaserOdometr_header.stamp;
-        markerNode.action = visualization_msgs::Marker::ADD;
-        markerNode.type = visualization_msgs::Marker::SPHERE_LIST;
-        markerNode.ns = "loop_nodes";
-        markerNode.id = 0;
-        markerNode.pose.orientation.w = 1;
-        markerNode.scale.x = 0.3; markerNode.scale.y = 0.3; markerNode.scale.z = 0.3; 
-        markerNode.color.r = 0; markerNode.color.g = 0.8; markerNode.color.b = 1;
-        markerNode.color.a = 1;
-        // loop edges
-        visualization_msgs::Marker markerEdge;
-        markerEdge.header.frame_id = "camera_init";
-        markerEdge.header.stamp = timeLaserOdometr_header.stamp;
-        markerEdge.action = visualization_msgs::Marker::ADD;
-        markerEdge.type = visualization_msgs::Marker::LINE_LIST;
-        markerEdge.ns = "loop_edges";
-        markerEdge.id = 1;
-        markerEdge.pose.orientation.w = 1;
-        markerEdge.scale.x = 0.1;
-        markerEdge.color.r = 0.9; markerEdge.color.g = 0.9; markerEdge.color.b = 0;
-        markerEdge.color.a = 1;
-
-        for (auto it = loopIndexContainer.begin(); it != loopIndexContainer.end(); ++it)
-        {
-            int key_cur = it->first;
-            int key_pre = it->second;
-            geometry_msgs::Point p;
-            
-            p.x = keyframePosesUpdated[key_cur].x;
-            p.y = keyframePosesUpdated[key_cur].y;
-            p.z = keyframePosesUpdated[key_cur].z;
-
-            // p.x = copy_cloudKeyPoses6D->points[key_cur].x;
-            // p.y = copy_cloudKeyPoses6D->points[key_cur].y;
-            // p.z = copy_cloudKeyPoses6D->points[key_cur].z;
-            markerNode.points.push_back(p);
-            markerEdge.points.push_back(p);
-            p.x = keyframePosesUpdated[key_pre].x;
-            p.y = keyframePosesUpdated[key_pre].y;
-            p.z = keyframePosesUpdated[key_pre].z;
-
-            // p.x = copy_cloudKeyPoses6D->points[key_pre].x;
-            // p.y = copy_cloudKeyPoses6D->points[key_pre].y;
-            // p.z = copy_cloudKeyPoses6D->points[key_pre].z;
-            markerNode.points.push_back(p);
-            markerEdge.points.push_back(p);
-        }
-
-        markerArray.markers.push_back(markerNode);
-        markerArray.markers.push_back(markerEdge);
-        pubLoopConstraintEdge.publish(markerArray);
-}
-
 
 void process_icp(void)
 {
     while(1)
     {
-		while ( !scLoopICPBuf.empty() )
+		// while ( !scLoopICPBuf.empty() )
+        // {
+        //     if( scLoopICPBuf.size() > 30 ) {
+        //         ROS_WARN("Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
+        //     }
+
+        //     mBuf.lock(); 
+        //     std::pair<int, int> loop_idx_pair = scLoopICPBuf.front();
+        //     scLoopICPBuf.pop();
+        //     mBuf.unlock(); 
+
+        //     const int prev_node_idx = loop_idx_pair.first;
+        //     const int curr_node_idx = loop_idx_pair.second;
+
+        //     auto relative_pose_optional = doICPVirtualRelative(prev_node_idx, curr_node_idx);
+        //     if(relative_pose_optional) {
+        //         gtsam::Pose3 relative_pose = relative_pose_optional.value();
+        //         mtxPosegraph.lock();
+        //         gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, robustLoopNoise));
+        //         // runISAM2opt();
+        //         mtxPosegraph.unlock();
+        //     } 
+        // }
+
+
+
+
+        while ( 1 )
         {
-            if( scLoopICPBuf.size() > 30 ) {
-                ROS_WARN("Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
-            }
-
-            mBuf.lock(); 
-            std::pair<int, int> loop_idx_pair = scLoopICPBuf.front();
-            scLoopICPBuf.pop();
-            mBuf.unlock(); 
-
-            const int prev_node_idx = loop_idx_pair.first;
-            const int curr_node_idx = loop_idx_pair.second;
-            auto relative_pose_optional = doICPVirtualRelative(prev_node_idx, curr_node_idx);
+           
+            cout<<"keyframePoses.size()="<<keyframePoses.size()<<endl;
+            if( keyframePoses.size() < 2330)
+                continue;
+            auto relative_pose_optional = doICPVirtualRelative(101, 2300);
             if(relative_pose_optional) {
                 gtsam::Pose3 relative_pose = relative_pose_optional.value();
                 mtxPosegraph.lock();
-                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, robustLoopNoise));
+                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(101, 2520, relative_pose, robustLoopNoise));
                 // runISAM2opt();
                 mtxPosegraph.unlock();
-            } 
+            }
+
+            // wait (must required for running the while loop)
+            std::chrono::milliseconds dura(100);
+            std::this_thread::sleep_for(dura); 
         }
 
         // wait (must required for running the while loop)
-        std::chrono::milliseconds dura(2);
-        std::this_thread::sleep_for(dura);
+        // std::chrono::milliseconds dura(2);
+        // std::this_thread::sleep_for(dura);
     }
 } // process_icp
 
@@ -925,11 +870,11 @@ void process_isam(void)
         if( gtSAMgraphMade ) {
             mtxPosegraph.lock();
             runISAM2opt();
-            //cout << "running isam2 optimization ..." << endl;
+            cout << "running isam2 optimization ..." << endl;
             mtxPosegraph.unlock();
 
-            // saveOptimizedVerticesKITTIformat(isamCurrentEstimate, pgKITTIformat); // pose
-            // saveOdometryVerticesKITTIformat(odomKITTIformat); // pose
+            saveOptimizedVerticesKITTIformat(isamCurrentEstimate, pgKITTIformat); // pose
+            saveOdometryVerticesKITTIformat(odomKITTIformat); // pose
         }
     }
 }
@@ -1005,19 +950,13 @@ int main(int argc, char **argv)
     scManager.setSCdistThres(scDistThres);
     scManager.setMaximumRadius(scMaximumRadius);
 
-    float filter_size = 0.2; 
+    float filter_size = 0.4; 
     downSizeFilterScancontext.setLeafSize(filter_size, filter_size, filter_size);
     downSizeFilterICP.setLeafSize(filter_size, filter_size, filter_size);
 
     double mapVizFilterSize;
 	nh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames 
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
-
-
-    cloudKeyPoses3D.reset(new pcl::PointCloud<PointType>());
-    copy_cloudKeyPoses3D.reset(new pcl::PointCloud<PointType>());
-    kdtreeHistoryKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
-
 
 	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
 	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
@@ -1031,12 +970,11 @@ int main(int argc, char **argv)
 	pubLoopScanLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_local", 100);
 	pubLoopSubmapLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_local", 100);
 
-    pubLoopConstraintEdge = nh.advertise<visualization_msgs::MarkerArray>("/lio_sam/mapping/loop_closure_constraints", 1);
-
+    pubLoopScanLocal_aftSac = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_local_aftSac", 100);
 
 	std::thread posegraph_slam {process_pg}; // pose graph construction
 	std::thread lc_detection {process_lcd}; // loop closure detection 
-	//std::thread icp_calculation {process_icp}; // loop constraint calculation via icp 
+	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp 
 	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added. 
 
 	std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
